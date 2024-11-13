@@ -1043,6 +1043,30 @@ impl<'app> Builder<'app> {
         self.map_window(|w| w.with_inner_size(winit::dpi::LogicalSize { width, height }))
     }
 
+    pub fn with_fullsize_content_view(self, fullsize_content_view: bool) -> Self {
+        self.map_window(|w| w.with_fullsize_content_view(fullsize_content_view))
+    }
+
+    pub fn with_titlebar_transparent(self, titlebar_transparent: bool) -> Self {
+        self.map_window(|w| w.with_titlebar_transparent(titlebar_transparent))
+    }
+
+    pub fn with_decorations(self, decorations: bool) -> Self {
+        self.map_window(|w| w.with_decorations(decorations))
+    }
+
+    pub fn with_titlebar_hidden(self, titlebar_hidden: bool) -> Self {
+        self.map_window(|w| w.with_titlebar_hidden(titlebar_hidden))
+    }
+
+    pub fn with_title_hidden(self, title_hidden: bool) -> Self {
+        self.map_window(|w| w.with_title_hidden(title_hidden))
+    }
+
+    pub fn with_has_shadow(self, has_shadow: bool) -> Self {
+        self.map_window(|w| w.with_has_shadow(has_shadow))
+    }
+
     /// Set the minimum size in points for the window.
     pub fn min_size(self, width: u32, height: u32) -> Self {
         self.map_window(|w| w.with_min_inner_size(winit::dpi::LogicalSize { width, height }))
