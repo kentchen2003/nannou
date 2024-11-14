@@ -36,9 +36,10 @@ pub mod window {
 
 /// Tracked state related to the keyboard.
 pub mod keys {
-    use crate::event::{Key, ModifiersState};
     use std::collections::HashSet;
     use std::ops::Deref;
+
+    use winit::keyboard::{KeyCode, ModifiersState};
 
     /// The state of the keyboard.
     #[derive(Clone, Debug, Default)]
@@ -52,11 +53,11 @@ pub mod keys {
     /// The set of keys that are currently pressed.
     #[derive(Clone, Debug, Default)]
     pub struct Down {
-        pub(crate) keys: HashSet<Key>,
+        pub(crate) keys: HashSet<KeyCode>,
     }
 
     impl Deref for Down {
-        type Target = HashSet<Key>;
+        type Target = HashSet<KeyCode>;
         fn deref(&self) -> &Self::Target {
             &self.keys
         }

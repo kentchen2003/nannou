@@ -5,7 +5,7 @@
 
 use crate::color::IntoLinSrgba;
 use crate::event::{
-    Key, MouseButton, MouseScrollDelta, TouchEvent, TouchPhase, TouchpadPressure, WindowEvent,
+    MouseButton, MouseScrollDelta, TouchEvent, TouchPhase, TouchpadPressure, WindowEvent,
 };
 use crate::frame::{self, Frame, RawFrame};
 use crate::geom;
@@ -20,12 +20,14 @@ use std::time::Duration;
 use std::{env, fmt};
 use wgpu_upstream::CompositeAlphaMode;
 use winit::dpi::{LogicalSize, PhysicalSize};
+use winit::event_loop::ActiveEventLoop;
+use winit::keyboard::KeyCode;
 #[cfg(target_os = "macos")]
 use winit::platform::macos::WindowBuilderExtMacOS;
 
 pub use winit::window::Fullscreen;
 pub use winit::window::WindowId as Id;
-use winit::window::{CursorGrabMode, WindowLevel};
+use winit::window::{CursorGrabMode, WindowAttributes, WindowLevel};
 
 /// The default dimensions used for a window in the case that none are specified.
 pub const DEFAULT_DIMENSIONS: LogicalSize<geom::scalar::Default> = LogicalSize {
@@ -42,7 +44,7 @@ pub const MIN_SC_PIXELS: PhysicalSize<u32> = PhysicalSize {
 /// A context for building a window.
 pub struct Builder<'app> {
     app: &'app App,
-    window: winit::window::WindowBuilder,
+    window_attributes: WindowAttributes,
     title_was_set: bool,
     surface_conf_builder: SurfaceConfigurationBuilder,
     power_preference: wgpu::PowerPreference,
@@ -111,10 +113,10 @@ pub type RawEventFn<Model> = fn(&App, &mut Model, &winit::event::WindowEvent);
 pub type EventFn<Model> = fn(&App, &mut Model, WindowEvent);
 
 /// A function for processing key press events.
-pub type KeyPressedFn<Model> = fn(&App, &mut Model, Key);
+pub type KeyPressedFn<Model> = fn(&App, &mut Model, KeyCode);
 
 /// A function for processing key release events.
-pub type KeyReleasedFn<Model> = fn(&App, &mut Model, Key);
+pub type KeyReleasedFn<Model> = fn(&App, &mut Model, KeyCode);
 
 /// A function for processing received characters.
 pub type ReceivedCharacterFn<Model> = fn(&App, &mut Model, char);
@@ -365,7 +367,7 @@ impl<'app> Builder<'app> {
     pub fn new(app: &'app App) -> Self {
         Builder {
             app,
-            window: winit::window::WindowBuilder::new(),
+            window_attributes: WindowAttributes::default(),
             title_was_set: false,
             surface_conf_builder: Default::default(),
             power_preference: Self::DEFAULT_POWER_PREFERENCE,
@@ -380,8 +382,8 @@ impl<'app> Builder<'app> {
     }
 
     /// Build the window with some custom window parameters.
-    pub fn window(mut self, window: winit::window::WindowBuilder) -> Self {
-        self.window = window;
+    pub fn window_attributes(mut self, window_attributes: WindowAttributes) -> Self {
+        self.window_attributes = window_attributes;
         self
     }
 
@@ -740,16 +742,17 @@ impl<'app> Builder<'app> {
 
     #[cfg(not(target_os = "unknown"))]
     /// Builds the window, inserts it into the `App`'s display map and returns the unique ID.
-    pub fn build(self) -> Result<Id, BuildError> {
+    pub fn build(self, event_loop: &ActiveEventLoop) -> Result<Id, BuildError> {
         tokio::task::block_in_place(move || {
-            tokio::runtime::Handle::current().block_on(async move { self.build_async().await })
+            tokio::runtime::Handle::current()
+                .block_on(async move { self.build_async(event_loop).await })
         })
     }
 
-    pub async fn build_async(self) -> Result<Id, BuildError> {
+    pub async fn build_async(self, event_loop: &ActiveEventLoop) -> Result<Id, BuildError> {
         let Builder {
             app,
-            mut window,
+            mut window_attributes,
             title_was_set,
             surface_conf_builder,
             power_preference,
@@ -768,7 +771,7 @@ impl<'app> Builder<'app> {
                 if let Some(os_str) = exe_path.file_stem() {
                     if let Some(exe_name) = os_str.to_str() {
                         let title = format!("nannou - {}", exe_name);
-                        window = window.with_title(title);
+                        window_attributes = window_attributes.with_title(title);
                     }
                 }
             }
@@ -803,12 +806,10 @@ impl<'app> Builder<'app> {
         }
 
         // Set default dimensions in the case that none were given.
-        let initial_window_size = window
-            .window_attributes()
+        let initial_window_size = window_attributes
             .inner_size
             .or_else(|| {
-                window
-                    .window_attributes()
+                window_attributes
                     .fullscreen
                     .as_ref()
                     .and_then(|fullscreen| match fullscreen {
@@ -831,7 +832,7 @@ impl<'app> Builder<'app> {
             })
             .unwrap_or_else(|| {
                 let mut dim = DEFAULT_DIMENSIONS;
-                if let Some(min) = window.window_attributes().min_inner_size {
+                if let Some(min) = window_attributes.min_inner_size {
                     match min {
                         winit::dpi::Size::Logical(min) => {
                             dim.width = dim.width.max(min.width as _);
@@ -844,7 +845,7 @@ impl<'app> Builder<'app> {
                         }
                     }
                 }
-                if let Some(max) = window.window_attributes().max_inner_size {
+                if let Some(max) = window_attributes.max_inner_size {
                     match max {
                         winit::dpi::Size::Logical(max) => {
                             dim.width = dim.width.min(max.width as _);
@@ -862,17 +863,14 @@ impl<'app> Builder<'app> {
 
         // Use the `initial_window_size` as the default dimensions for the window if none
         // were specified.
-        if window.window_attributes().inner_size.is_none()
-            && window.window_attributes().fullscreen.is_none()
-        {
-            window = window.with_inner_size(initial_window_size);
+        if window_attributes.inner_size.is_none() && window_attributes.fullscreen.is_none() {
+            window_attributes = window_attributes.with_inner_size(initial_window_size);
         }
 
         // Set a default minimum window size for configuring the surface.
-        if window.window_attributes().min_inner_size.is_none()
-            && window.window_attributes().fullscreen.is_none()
-        {
-            window = window.with_min_inner_size(winit::dpi::Size::Physical(MIN_SC_PIXELS));
+        if window_attributes.min_inner_size.is_none() && window_attributes.fullscreen.is_none() {
+            window_attributes =
+                window_attributes.with_min_inner_size(winit::dpi::Size::Physical(MIN_SC_PIXELS));
         }
 
         // Background must be initially cleared
@@ -880,7 +878,7 @@ impl<'app> Builder<'app> {
 
         let clear_color = clear_color.unwrap_or_else(|| {
             let mut color: wgpu::Color = Default::default();
-            color.a = if window.window_attributes().transparent {
+            color.a = if window_attributes.transparent {
                 0.0
             } else {
                 1.0
@@ -889,14 +887,7 @@ impl<'app> Builder<'app> {
         });
 
         // Build the window.
-        let window = {
-            let window_target = app
-                .event_loop_window_target
-                .as_ref()
-                .expect("unexpected invalid App.event_loop_window_target state - please report")
-                .as_ref();
-            window.build(window_target)?
-        };
+        let window = event_loop.create_window(window_attributes).unwrap();
 
         #[cfg(target_arch = "wasm32")]
         {
@@ -1243,7 +1234,7 @@ impl Window {
     /// See the `inner_size` methods for more informations about the values.
     pub fn set_inner_size_pixels(&self, width: u32, height: u32) {
         self.window
-            .set_inner_size(winit::dpi::PhysicalSize { width, height })
+            .request_inner_size(winit::dpi::PhysicalSize { width, height });
     }
 
     /// Modifies the inner size of the window using point values.
@@ -1251,7 +1242,7 @@ impl Window {
     /// See the `inner_size` methods for more informations about the values.
     pub fn set_inner_size_points(&self, width: f32, height: f32) {
         self.window
-            .set_inner_size(winit::dpi::LogicalSize { width, height })
+            .request_inner_size(winit::dpi::LogicalSize { width, height });
     }
 
     /// The width and height of the window in pixels.
@@ -1408,17 +1399,6 @@ impl Window {
         self.window.set_window_icon(window_icon)
     }
 
-    /// Sets the location of IME candidate box in client area coordinates relative to the top left.
-    ///
-    /// ## Platform-specific
-    ///
-    /// - **iOS:** Has no effect.
-    /// - **Web:** Has no effect.
-    pub fn set_ime_position_points(&self, x: f32, y: f32) {
-        self.window
-            .set_ime_position(winit::dpi::LogicalPosition { x, y })
-    }
-
     /// Modifies the mouse cursor of the window.
     ///
     /// ## Platform-specific
@@ -1426,7 +1406,7 @@ impl Window {
     /// - **iOS:** Has no effect.
     /// - **Android:** Has no effect.
     pub fn set_cursor_icon(&self, state: winit::window::CursorIcon) {
-        self.window.set_cursor_icon(state);
+        self.window.set_cursor(state);
     }
 
     /// Changes the position of the cursor in logical window coordinates.

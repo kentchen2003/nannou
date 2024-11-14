@@ -4,8 +4,8 @@ pub use crate::app::{self, App, LoopMode};
 pub use crate::draw::Draw;
 pub use crate::event::WindowEvent::*;
 pub use crate::event::{
-    AxisMotion, Event, Key, MouseButton, MouseScrollDelta, TouchEvent, TouchPhase,
-    TouchpadPressure, Update, WindowEvent,
+    AxisMotion, Event, MouseButton, MouseScrollDelta, TouchEvent, TouchPhase, TouchpadPressure,
+    Update, WindowEvent,
 };
 pub use crate::frame::{Frame, RawFrame};
 pub use crate::io::{load_from_json, load_from_toml, safe_file_save, save_to_json, save_to_toml};

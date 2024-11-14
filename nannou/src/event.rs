@@ -13,15 +13,13 @@ use crate::App;
 use std::path::PathBuf;
 use winit;
 
-pub use winit::event::{
-    ElementState, KeyboardInput, ModifiersState, MouseButton, MouseScrollDelta, TouchPhase,
-    VirtualKeyCode as Key,
-};
+pub use winit::event::{ElementState, MouseButton, MouseScrollDelta, TouchPhase};
+use winit::keyboard::KeyCode;
 
 /// Event types that are compatible with the nannou app loop.
 pub trait LoopEvent: 'static + From<Update> {
     /// Produce a loop event from the given winit event.
-    fn from_winit_event<'a, T>(_: &winit::event::Event<'a, T>, _: &App) -> Option<Self>;
+    fn from_winit_event<T>(_: &winit::event::Event<T>, _: &App) -> Option<Self>;
 }
 
 /// Update event, emitted on each pass of an application loop.
@@ -116,13 +114,10 @@ pub enum WindowEvent {
     Moved(Point2),
 
     /// The given keyboard key was pressed.
-    KeyPressed(Key),
+    KeyPressed(KeyCode),
 
     /// The given keyboard key was released.
-    KeyReleased(Key),
-
-    /// Character input received event.
-    ReceivedCharacter(char),
+    KeyReleased(KeyCode),
 
     /// The mouse moved to the given x, y position.
     MouseMoved(Point2),
@@ -286,17 +281,13 @@ impl WindowEvent {
                 stage: stage.clone(),
             }),
 
-            winit::event::WindowEvent::KeyboardInput { input, .. } => match input.virtual_keycode {
-                Some(key) => match input.state {
-                    ElementState::Pressed => KeyPressed(key),
-                    ElementState::Released => KeyReleased(key),
+            winit::event::WindowEvent::KeyboardInput { event, .. } => match event.physical_key {
+                winit::keyboard::PhysicalKey::Code(key_code) => match event.state {
+                    ElementState::Pressed => KeyPressed(key_code),
+                    ElementState::Released => KeyReleased(key_code),
                 },
-                None => return None,
+                winit::keyboard::PhysicalKey::Unidentified(_) => return None,
             },
-
-            winit::event::WindowEvent::ReceivedCharacter(char) => {
-                WindowEvent::ReceivedCharacter(char.clone())
-            }
 
             winit::event::WindowEvent::ModifiersChanged(_) => {
                 return None;
@@ -308,11 +299,16 @@ impl WindowEvent {
                 return None;
             }
             // new 0.28 events
-            winit::event::WindowEvent::Ime(_)
-            | winit::event::WindowEvent::TouchpadMagnify { .. }
-            | winit::event::WindowEvent::SmartMagnify { .. }
-            | winit::event::WindowEvent::TouchpadRotate { .. }
-            | winit::event::WindowEvent::Occluded(_) => return None,
+            winit::event::WindowEvent::Ime(_) | winit::event::WindowEvent::Occluded(_) => {
+                return None
+            }
+
+            winit::event::WindowEvent::ActivationTokenDone { .. }
+            | winit::event::WindowEvent::PinchGesture { .. }
+            | winit::event::WindowEvent::PanGesture { .. }
+            | winit::event::WindowEvent::DoubleTapGesture { .. }
+            | winit::event::WindowEvent::RotationGesture { .. }
+            | winit::event::WindowEvent::RedrawRequested => return None,
         };
 
         Some(event)
@@ -321,7 +317,7 @@ impl WindowEvent {
 
 impl LoopEvent for Event {
     /// Convert the given `winit::event::Event` to a nannou `Event`.
-    fn from_winit_event<'a, T>(event: &winit::event::Event<'a, T>, app: &App) -> Option<Self> {
+    fn from_winit_event<T>(event: &winit::event::Event<T>, app: &App) -> Option<Self> {
         let event = match event {
             winit::event::Event::WindowEvent { window_id, event } => {
                 let windows = app.windows.borrow();
@@ -348,12 +344,10 @@ impl LoopEvent for Event {
             }
             winit::event::Event::Suspended => Event::Suspended,
             winit::event::Event::Resumed => Event::Resumed,
-            winit::event::Event::NewEvents(_)
-            | winit::event::Event::UserEvent(_)
-            | winit::event::Event::MainEventsCleared
-            | winit::event::Event::RedrawRequested(_)
-            | winit::event::Event::RedrawEventsCleared
-            | winit::event::Event::LoopDestroyed => return None,
+            winit::event::Event::NewEvents(_) | winit::event::Event::UserEvent(_) => return None,
+            winit::event::Event::AboutToWait => return None,
+            winit::event::Event::LoopExiting => return None,
+            winit::event::Event::MemoryWarning => return None,
         };
         Some(event)
     }

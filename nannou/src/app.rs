@@ -9,7 +9,7 @@
 //! - [**LoopMode**](./enum.LoopMode.html) - describes the behaviour of the application event loop.
 
 use crate::draw;
-use crate::event::{self, Event, Key, LoopEvent, Update};
+use crate::event::{self, Event, LoopEvent, Update};
 use crate::frame::{Frame, RawFrame};
 use crate::geom;
 use crate::state;
@@ -18,6 +18,7 @@ use crate::wgpu;
 use crate::window::{self, Window};
 use find_folder;
 use instant::Instant;
+use winit::application::ApplicationHandler;
 use std::cell::{RefCell, RefMut};
 use std::collections::HashMap;
 use std::future::Future;
@@ -29,7 +30,8 @@ use std::time::Duration;
 use std::{self, future};
 use wgpu_upstream::InstanceDescriptor;
 use winit;
-use winit::event_loop::ControlFlow;
+use winit::event_loop::{ControlFlow, EventLoop};
+use winit::keyboard::KeyCode;
 
 /// The user function type for initialising their model.
 pub type ModelFn<Model> = fn(&App) -> Model;
@@ -108,7 +110,7 @@ pub struct App {
     default_window_size: Option<DefaultWindowSize>,
     max_capture_frame_jobs: u32,
     capture_frame_timeout: Option<Duration>,
-    pub(crate) event_loop_window_target: Option<EventLoopWindowTarget>,
+    event_loop: EventLoop<()>,
     pub(crate) event_loop_proxy: Proxy,
     pub(crate) windows: RefCell<HashMap<window::Id, Window>>,
     /// The wgpu backends to choose between.
@@ -156,6 +158,191 @@ pub struct App {
     /// the number becomes higher. Instead, we recommend using `app.duration.since_start` or
     /// `app.duration.since_prev_update` to access a more precise form of app time.
     pub time: f32,
+}
+
+impl ApplicationHandler for App {
+    fn resumed(&mut self, event_loop: &winit::event_loop::ActiveEventLoop) {
+        let result = self.new_window().build(event_loop);
+        match result {
+            Ok(window_id) => {
+                *self.focused_window.borrow_mut() = Some(window_id);
+            }
+            Err(_) => {}
+        }
+    }
+
+    fn window_event(
+        &mut self,
+        event_loop: &winit::event_loop::ActiveEventLoop,
+        window_id: winit::window::WindowId,
+        event: winit::event::WindowEvent,
+    ) {
+        match event {
+            winit::event::WindowEvent::RedrawRequested => {
+                if let Some(model) = model.as_mut() {
+                    // Retrieve the surface frame and the number of this frame.
+                    // NOTE: We avoid mutably borrowing `windows` map any longer than necessary to
+                    // avoid restricting users from accessing `windows` during `view`.
+                    let (mut surface_tex_result, nth_frame) = {
+                        let mut windows = app.windows.borrow_mut();
+                        let window = windows
+                            .get_mut(&window_id)
+                            .expect("no window for `RedrawRequest`");
+                        let texture = window.surface.get_current_texture();
+                        let nth_frame = window.frame_count;
+                        (texture, nth_frame)
+                    };
+
+                    if let Err(e) = &surface_tex_result {
+                        match e {
+                            // Sometimes redraws get delivered before resizes on x11 for unclear reasons.
+                            // It goes all the way down to the API: if you ask x11 about the window size
+                            // at this time, it'll tell you that it hasn't changed. So... we skip
+                            // this frame. The resize will show up in a bit and then we can get on
+                            // with our lives.
+                            // If you turn on debug logging this does occasionally cause some vulkan
+                            // validation errors... that's not great.
+                            // TODO find a better long-term fix than ignoring.
+                            wgpu::SurfaceError::Lost => {
+                                // Attempt to reconfigure the surface.
+                                let mut windows = app.windows.borrow_mut();
+                                let window = windows
+                                    .get_mut(&window_id)
+                                    .expect("no window for `RedrawRequest`");
+                                window
+                                    .reconfigure_surface(window.tracked_state.physical_size.into());
+                                surface_tex_result = window.surface.get_current_texture();
+                            }
+                            wgpu::SurfaceError::Outdated => {} // skip frame
+                            wgpu::SurfaceError::Timeout => {}  // skip frame
+                            wgpu::SurfaceError::OutOfMemory => {
+                                panic!("out of memory acquiring the surface frame: {}", e);
+                            }
+                        }
+                    }
+
+                    if let Ok(surface_tex) = surface_tex_result {
+                        let surface_texture = &surface_tex
+                            .texture
+                            .create_view(&wgpu::TextureViewDescriptor::default());
+
+                        // Borrow the window now that we don't need it mutably until setting the render
+                        // data back.
+                        let windows = app.windows.borrow();
+                        let window = windows
+                            .get(&window_id)
+                            .expect("failed to find window for redraw request");
+                        let frame_data = &window.frame_data;
+
+                        // Construct and emit a frame via `view` for receiving the user's graphics commands.
+                        let sf = window.tracked_state.scale_factor;
+                        let (w, h) = window
+                            .tracked_state
+                            .physical_size
+                            .to_logical::<f32>(sf)
+                            .into();
+                        let window_rect = geom::Rect::from_w_h(w, h);
+                        let raw_frame = RawFrame::new_empty(
+                            window.device_queue_pair().clone(),
+                            window_id,
+                            nth_frame,
+                            surface_texture,
+                            window.surface_conf.format,
+                            window_rect,
+                        );
+
+                        // Clear the raw frame immediately once the window is invalidated
+                        if window.is_invalidated {
+                            if let Some(data) = frame_data {
+                                raw_frame.clear(&data.render.texture_view(), window.clear_color);
+                            }
+                        }
+
+                        // If the user specified a view function specifically for this window, use it.
+                        // Otherwise, use the fallback, default view passed to the app if there was one.
+                        let window_view = window.user_functions.view.clone();
+
+                        match window_view {
+                            Some(window::View::Sketch(view)) => {
+                                let data = frame_data.as_ref().expect("missing `frame_data`");
+                                let frame =
+                                    Frame::new_empty(raw_frame, &data.render, &data.capture);
+                                view(&app, frame);
+                            }
+                            Some(window::View::WithModel(view)) => {
+                                let data = frame_data.as_ref().expect("missing `frame_data`");
+                                let frame =
+                                    Frame::new_empty(raw_frame, &data.render, &data.capture);
+                                let view = view.to_fn_ptr::<M>().expect(
+                                    "unexpected model argument given to window view function",
+                                );
+                                (*view)(&app, model, frame);
+                            }
+                            Some(window::View::WithModelRaw(raw_view)) => {
+                                let raw_view = raw_view.to_fn_ptr::<M>().expect(
+                                    "unexpected model argument given to window raw_view function",
+                                );
+                                (*raw_view)(&app, &model, raw_frame);
+                            }
+                            None => match default_view {
+                                Some(View::Sketch(view)) => {
+                                    let data = frame_data.as_ref().expect("missing `frame_data`");
+                                    let frame =
+                                        Frame::new_empty(raw_frame, &data.render, &data.capture);
+                                    view(&app, frame);
+                                }
+                                Some(View::WithModel(view)) => {
+                                    let data = frame_data.as_ref().expect("missing `frame_data`");
+                                    let frame =
+                                        Frame::new_empty(raw_frame, &data.render, &data.capture);
+                                    view(&app, &model, frame);
+                                }
+                                None => raw_frame.submit(),
+                            },
+                        }
+
+                        // Queue has been submitted by now, time to present.
+                        surface_tex.present();
+
+                        // Release immutable lock
+                        drop(windows);
+
+                        // Increment the window's frame count.
+                        let mut windows = app.windows.borrow_mut();
+                        let window = windows
+                            .get_mut(&window_id)
+                            .expect("no window for redraw request ID");
+
+                        // Assume invalidated window was cleared above before `view()`
+                        window.is_invalidated = false;
+                        window.frame_count += 1;
+                    }
+                }
+
+                app.wgpu_adapters().clear_inactive_adapters_and_devices();
+            }
+            
+            winit::event::WindowEvent::Resized(new_inner_size) => {
+                let mut windows = app.windows.borrow_mut();
+                if let Some(window) = windows.get_mut(&window_id) {
+                    window.reconfigure_surface(new_inner_size.clone().into());
+                }
+            }
+
+            winit::event::WindowEvent::ScaleFactorChanged {
+                scale_factor,
+                inner_size_writer,
+            } => {
+                let mut windows = app.windows.borrow_mut();
+                if let Some(window) = windows.get_mut(&window_id) {
+                    window.tracked_state.scale_factor = scale_factor;
+                }
+            }
+            _ => {
+                loop_state.updates_since_event = 0;
+            }
+        }
+    }
 }
 
 /// Miscellaneous app configuration parameters.
@@ -474,7 +661,7 @@ where
 
     pub async fn run_async(self) {
         // Start the winit window event loop.
-        let event_loop = winit::event_loop::EventLoop::new();
+        let event_loop = winit::event_loop::EventLoop::new().unwrap();
 
         // Create the proxy used to awaken the event loop.
         let event_loop_proxy = event_loop.create_proxy();
@@ -491,26 +678,16 @@ where
         let capture_frame_timeout = self
             .capture_frame_timeout
             .unwrap_or(Some(Self::DEFAULT_CAPTURE_FRAME_TIMEOUT));
-        let event_loop_window_target = Some(EventLoopWindowTarget::Owned(event_loop));
         let app = App::new(
             self.config,
+            event_loop,
             event_loop_proxy,
-            event_loop_window_target,
             self.default_window_size,
             max_capture_frame_jobs,
             capture_frame_timeout,
             self.backends,
         );
 
-        // Create the default window if necessary
-        if self.create_default_window {
-            let window_id = app
-                .new_window()
-                .build_async()
-                .await
-                .expect("could not build default app window");
-            *app.focused_window.borrow_mut() = Some(window_id);
-        }
 
         // Call the user's model function.
         let model = Pin::from((self.model)(&app)).await;
@@ -648,8 +825,8 @@ impl App {
     // Create a new `App`.
     fn new(
         config: Config,
+        event_loop: EventLoop<()>,
         event_loop_proxy: Proxy,
-        event_loop_window_target: Option<EventLoopWindowTarget>,
         default_window_size: Option<DefaultWindowSize>,
         max_capture_frame_jobs: u32,
         capture_frame_timeout: Option<Duration>,
@@ -672,7 +849,7 @@ impl App {
         let time = duration.since_start.secs() as _;
         let app = App {
             event_loop_proxy,
-            event_loop_window_target,
+            event_loop,
             default_window_size,
             max_capture_frame_jobs,
             capture_frame_timeout,
@@ -1027,42 +1204,6 @@ pub fn find_project_path() -> Result<PathBuf, find_folder::Error> {
     Err(find_folder::Error::NotFound)
 }
 
-// This type allows the `App` to provide an API for creating new windows.
-//
-// During the `setup` before the
-pub(crate) enum EventLoopWindowTarget {
-    // Ownership over the event loop.
-    //
-    // This is the state before the `EventLoop::run` begins.
-    Owned(winit::event_loop::EventLoop<()>),
-    // A pointer to the target for building windows.
-    //
-    // This is the state during `EventLoop::run`. This pointer becomes invalid following
-    // `EventLoop::run`, so it is essential to take care that we are in the correct state when
-    // using this pointer.
-    Pointer(*const winit::event_loop::EventLoopWindowTarget<()>),
-}
-
-impl EventLoopWindowTarget {
-    // Take a reference to the inner event loop window target.
-    //
-    // This method is solely used during `window::Builder::build` to allow for
-    pub(crate) fn as_ref(&self) -> &winit::event_loop::EventLoopWindowTarget<()> {
-        match *self {
-            EventLoopWindowTarget::Owned(ref event_loop) => &**event_loop,
-            EventLoopWindowTarget::Pointer(ptr) => {
-                // This cast is safe, assuming that the `App`'s `EventLoopWindowTarget` will only
-                // ever be in the `Pointer` state while the pointer is valid - that is, during the
-                // call to `EventLoop::run`. Great care is taken to ensure that the
-                // `EventLoopWindowTarget` is dropped immediately after `EventLoop::run` completes.
-                // This allows us to take care of abiding by the `EventLoopWindowTarget` lifetime
-                // manually while avoiding having the lifetime propagate up through the `App` type.
-                unsafe { &*ptr as &winit::event_loop::EventLoopWindowTarget<()> }
-            }
-        }
-    }
-}
-
 // Application Loop.
 //
 // Beyond this point lies the master function for running the main application loop!
@@ -1093,10 +1234,7 @@ fn run_loop<M, E>(
     let mut model = Some(model);
 
     // Take ownership of the `EventLoop` from the `App`.
-    let event_loop = match app.event_loop_window_target.take() {
-        Some(EventLoopWindowTarget::Owned(event_loop)) => event_loop,
-        _ => unreachable!("the app should always own the event loop at this point"),
-    };
+    let event_loop = app.event_loop;
 
     // Keep track of state related to the loop mode itself.
     let mut loop_state = LoopState {
@@ -1116,193 +1254,185 @@ fn run_loop<M, E>(
         let mut exit = false;
 
         match event {
-            // Check to see if we need to emit an update and request a redraw.
-            winit::event::Event::MainEventsCleared => {
-                if let Some(model) = model.as_mut() {
-                    let loop_mode = app.loop_mode();
-                    let now = Instant::now();
-                    let mut do_update = |loop_state: &mut LoopState| {
-                        apply_update(&mut app, model, event_fn, update_fn, loop_state, now);
-                    };
-                    match loop_mode {
-                        LoopMode::NTimes { number_of_updates }
-                            if loop_state.total_updates >= number_of_updates as u64 => {}
-                        // Sometimes winit interrupts ControlFlow::Wait for no good reason, so we
-                        // make sure that there were some events in order to do an update when
-                        // LoopMode::Wait is used.
-                        LoopMode::Wait if loop_state.updates_since_event > 0 => {}
-                        // TODO: Consider allowing for a custom number of updates like so:
-                        // LoopMode::Wait { updates_before_waiting } =>
-                        //     if loop_state.updates_since_event > updates_before_waiting as u64 => {}
-                        _ => {
-                            do_update(&mut loop_state);
-                        },
-                    }
-                }
-            }
 
             // Request a frame from the user for the specified window.
             //
             // TODO: Only request a frame from the user if this redraw was requested following an
             // update. Otherwise, just use the existing intermediary frame.
-            winit::event::Event::RedrawRequested(window_id) => {
-                if let Some(model) = model.as_mut() {
-                    // Retrieve the surface frame and the number of this frame.
-                    // NOTE: We avoid mutably borrowing `windows` map any longer than necessary to
-                    // avoid restricting users from accessing `windows` during `view`.
-                    let (mut surface_tex_result, nth_frame) = {
-                        let mut windows = app.windows.borrow_mut();
-                        let window = windows
-                            .get_mut(&window_id)
-                            .expect("no window for `RedrawRequest`");
-                        let texture = window.surface.get_current_texture();
-                        let nth_frame = window.frame_count;
-                        (texture, nth_frame)
-                    };
-
-                    if let Err(e) = &surface_tex_result {
-                        match e {
-                            // Sometimes redraws get delivered before resizes on x11 for unclear reasons.
-                            // It goes all the way down to the API: if you ask x11 about the window size
-                            // at this time, it'll tell you that it hasn't changed. So... we skip
-                            // this frame. The resize will show up in a bit and then we can get on
-                            // with our lives.
-                            // If you turn on debug logging this does occasionally cause some vulkan
-                            // validation errors... that's not great.
-                            // TODO find a better long-term fix than ignoring.
-                            wgpu::SurfaceError::Lost => {
-                                // Attempt to reconfigure the surface.
+            winit::event::Event::WindowEvent{window_id, event: win_event} => {
+                match win_event {
+                    winit::event::WindowEvent::RedrawRequested => {
+                        if let Some(model) = model.as_mut() {
+                            // Retrieve the surface frame and the number of this frame.
+                            // NOTE: We avoid mutably borrowing `windows` map any longer than necessary to
+                            // avoid restricting users from accessing `windows` during `view`.
+                            let (mut surface_tex_result, nth_frame) = {
                                 let mut windows = app.windows.borrow_mut();
                                 let window = windows
                                     .get_mut(&window_id)
                                     .expect("no window for `RedrawRequest`");
-                                window
-                                    .reconfigure_surface(window.tracked_state.physical_size.into());
-                                surface_tex_result = window.surface.get_current_texture();
+                                let texture = window.surface.get_current_texture();
+                                let nth_frame = window.frame_count;
+                                (texture, nth_frame)
+                            };
+        
+                            if let Err(e) = &surface_tex_result {
+                                match e {
+                                    // Sometimes redraws get delivered before resizes on x11 for unclear reasons.
+                                    // It goes all the way down to the API: if you ask x11 about the window size
+                                    // at this time, it'll tell you that it hasn't changed. So... we skip
+                                    // this frame. The resize will show up in a bit and then we can get on
+                                    // with our lives.
+                                    // If you turn on debug logging this does occasionally cause some vulkan
+                                    // validation errors... that's not great.
+                                    // TODO find a better long-term fix than ignoring.
+                                    wgpu::SurfaceError::Lost => {
+                                        // Attempt to reconfigure the surface.
+                                        let mut windows = app.windows.borrow_mut();
+                                        let window = windows
+                                            .get_mut(&window_id)
+                                            .expect("no window for `RedrawRequest`");
+                                        window
+                                            .reconfigure_surface(window.tracked_state.physical_size.into());
+                                        surface_tex_result = window.surface.get_current_texture();
+                                    }
+                                    wgpu::SurfaceError::Outdated => {} // skip frame
+                                    wgpu::SurfaceError::Timeout => {}  // skip frame
+                                    wgpu::SurfaceError::OutOfMemory => {
+                                        panic!("out of memory acquiring the surface frame: {}", e);
+                                    }
+                                }
                             }
-                            wgpu::SurfaceError::Outdated => {} // skip frame
-                            wgpu::SurfaceError::Timeout => {}  // skip frame
-                            wgpu::SurfaceError::OutOfMemory => {
-                                panic!("out of memory acquiring the surface frame: {}", e);
+        
+                            if let Ok(surface_tex) = surface_tex_result {
+                                let surface_texture = &surface_tex
+                                    .texture
+                                    .create_view(&wgpu::TextureViewDescriptor::default());
+        
+                                // Borrow the window now that we don't need it mutably until setting the render
+                                // data back.
+                                let windows = app.windows.borrow();
+                                let window = windows
+                                    .get(&window_id)
+                                    .expect("failed to find window for redraw request");
+                                let frame_data = &window.frame_data;
+        
+                                // Construct and emit a frame via `view` for receiving the user's graphics commands.
+                                let sf = window.tracked_state.scale_factor;
+                                let (w, h) = window
+                                    .tracked_state
+                                    .physical_size
+                                    .to_logical::<f32>(sf)
+                                    .into();
+                                let window_rect = geom::Rect::from_w_h(w, h);
+                                let raw_frame = RawFrame::new_empty(
+                                    window.device_queue_pair().clone(),
+                                    window_id,
+                                    nth_frame,
+                                    surface_texture,
+                                    window.surface_conf.format,
+                                    window_rect,
+                                );
+        
+                                // Clear the raw frame immediately once the window is invalidated
+                                if window.is_invalidated {
+                                    if let Some(data) = frame_data {
+                                        raw_frame.clear(&data.render.texture_view(), window.clear_color);
+                                    }
+                                }
+        
+                                // If the user specified a view function specifically for this window, use it.
+                                // Otherwise, use the fallback, default view passed to the app if there was one.
+                                let window_view = window.user_functions.view.clone();
+        
+                                match window_view {
+                                    Some(window::View::Sketch(view)) => {
+                                        let data = frame_data.as_ref().expect("missing `frame_data`");
+                                        let frame =
+                                            Frame::new_empty(raw_frame, &data.render, &data.capture);
+                                        view(&app, frame);
+                                    }
+                                    Some(window::View::WithModel(view)) => {
+                                        let data = frame_data.as_ref().expect("missing `frame_data`");
+                                        let frame =
+                                            Frame::new_empty(raw_frame, &data.render, &data.capture);
+                                        let view = view.to_fn_ptr::<M>().expect(
+                                            "unexpected model argument given to window view function",
+                                        );
+                                        (*view)(&app, model, frame);
+                                    }
+                                    Some(window::View::WithModelRaw(raw_view)) => {
+                                        let raw_view = raw_view.to_fn_ptr::<M>().expect(
+                                            "unexpected model argument given to window raw_view function",
+                                        );
+                                        (*raw_view)(&app, &model, raw_frame);
+                                    }
+                                    None => match default_view {
+                                        Some(View::Sketch(view)) => {
+                                            let data = frame_data.as_ref().expect("missing `frame_data`");
+                                            let frame =
+                                                Frame::new_empty(raw_frame, &data.render, &data.capture);
+                                            view(&app, frame);
+                                        }
+                                        Some(View::WithModel(view)) => {
+                                            let data = frame_data.as_ref().expect("missing `frame_data`");
+                                            let frame =
+                                                Frame::new_empty(raw_frame, &data.render, &data.capture);
+                                            view(&app, &model, frame);
+                                        }
+                                        None => raw_frame.submit(),
+                                    },
+                                }
+        
+                                // Queue has been submitted by now, time to present.
+                                surface_tex.present();
+        
+                                // Release immutable lock
+                                drop(windows);
+        
+                                // Increment the window's frame count.
+                                let mut windows = app.windows.borrow_mut();
+                                let window = windows
+                                    .get_mut(&window_id)
+                                    .expect("no window for redraw request ID");
+        
+                                // Assume invalidated window was cleared above before `view()`
+                                window.is_invalidated = false;
+                                window.frame_count += 1;
                             }
+                        }
+
+                        app.wgpu_adapters().clear_inactive_adapters_and_devices();
+                    }
+                    
+                    winit::event::WindowEvent::Resized(new_inner_size) => {
+                        let mut windows = app.windows.borrow_mut();
+                        if let Some(window) = windows.get_mut(&window_id) {
+                            window.reconfigure_surface(new_inner_size.clone().into());
                         }
                     }
 
-                    if let Ok(surface_tex) = surface_tex_result {
-                        let surface_texture = &surface_tex
-                            .texture
-                            .create_view(&wgpu::TextureViewDescriptor::default());
-
-                        // Borrow the window now that we don't need it mutably until setting the render
-                        // data back.
-                        let windows = app.windows.borrow();
-                        let window = windows
-                            .get(&window_id)
-                            .expect("failed to find window for redraw request");
-                        let frame_data = &window.frame_data;
-
-                        // Construct and emit a frame via `view` for receiving the user's graphics commands.
-                        let sf = window.tracked_state.scale_factor;
-                        let (w, h) = window
-                            .tracked_state
-                            .physical_size
-                            .to_logical::<f32>(sf)
-                            .into();
-                        let window_rect = geom::Rect::from_w_h(w, h);
-                        let raw_frame = RawFrame::new_empty(
-                            window.device_queue_pair().clone(),
-                            window_id,
-                            nth_frame,
-                            surface_texture,
-                            window.surface_conf.format,
-                            window_rect,
-                        );
-
-                        // Clear the raw frame immediately once the window is invalidated
-                        if window.is_invalidated {
-                            if let Some(data) = frame_data {
-                                raw_frame.clear(&data.render.texture_view(), window.clear_color);
-                            }
-                        }
-
-                        // If the user specified a view function specifically for this window, use it.
-                        // Otherwise, use the fallback, default view passed to the app if there was one.
-                        let window_view = window.user_functions.view.clone();
-
-                        match window_view {
-                            Some(window::View::Sketch(view)) => {
-                                let data = frame_data.as_ref().expect("missing `frame_data`");
-                                let frame =
-                                    Frame::new_empty(raw_frame, &data.render, &data.capture);
-                                view(&app, frame);
-                            }
-                            Some(window::View::WithModel(view)) => {
-                                let data = frame_data.as_ref().expect("missing `frame_data`");
-                                let frame =
-                                    Frame::new_empty(raw_frame, &data.render, &data.capture);
-                                let view = view.to_fn_ptr::<M>().expect(
-                                    "unexpected model argument given to window view function",
-                                );
-                                (*view)(&app, model, frame);
-                            }
-                            Some(window::View::WithModelRaw(raw_view)) => {
-                                let raw_view = raw_view.to_fn_ptr::<M>().expect(
-                                    "unexpected model argument given to window raw_view function",
-                                );
-                                (*raw_view)(&app, &model, raw_frame);
-                            }
-                            None => match default_view {
-                                Some(View::Sketch(view)) => {
-                                    let data = frame_data.as_ref().expect("missing `frame_data`");
-                                    let frame =
-                                        Frame::new_empty(raw_frame, &data.render, &data.capture);
-                                    view(&app, frame);
-                                }
-                                Some(View::WithModel(view)) => {
-                                    let data = frame_data.as_ref().expect("missing `frame_data`");
-                                    let frame =
-                                        Frame::new_empty(raw_frame, &data.render, &data.capture);
-                                    view(&app, &model, frame);
-                                }
-                                None => raw_frame.submit(),
-                            },
-                        }
-
-                        // Queue has been submitted by now, time to present.
-                        surface_tex.present();
-
-                        // Release immutable lock
-                        drop(windows);
-
-                        // Increment the window's frame count.
+                    winit::event::WindowEvent::ScaleFactorChanged {
+                        scale_factor,
+                        inner_size_writer,
+                    } => {
                         let mut windows = app.windows.borrow_mut();
-                        let window = windows
-                            .get_mut(&window_id)
-                            .expect("no window for redraw request ID");
-
-                        // Assume invalidated window was cleared above before `view()`
-                        window.is_invalidated = false;
-                        window.frame_count += 1;
+                        if let Some(window) = windows.get_mut(&window_id) {
+                            window.tracked_state.scale_factor = scale_factor;
+                        }
+                    }
+                    _ => {
+                        loop_state.updates_since_event = 0;
                     }
                 }
-            }
-
-            // Clear any inactive adapters and devices and poll those remaining.
-            winit::event::Event::RedrawEventsCleared => {
-                app.wgpu_adapters().clear_inactive_adapters_and_devices();
-                // TODO: This seems to cause some glitching and slows down macOS drastically.
-                // While not necessary, this would be nice to have to automatically process async
-                // read/write callbacks submitted by users who aren't aware that they need to poll
-                // their devices in order to make them do work. Perhaps as a workaround we could
-                // only poll devices that aren't already associated with a window?
-                //app.wgpu_adapters().poll_all_devices(false);
+                
+                
             }
 
             // For all window, device and user (app proxy) events reset the `updates_since_event`
             // count which is used to improve behaviour for the `Wait` loop mode.
             // TODO: Document this set of events under `LoopMode::Wait`.
-            winit::event::Event::WindowEvent { .. }
-            | winit::event::Event::DeviceEvent { .. }
+            winit::event::Event::DeviceEvent { .. }
             | winit::event::Event::UserEvent(_)
             | winit::event::Event::Suspended
             | winit::event::Event::Resumed => {
@@ -1316,37 +1446,10 @@ fn run_loop<M, E>(
 
             // Ignore `NewEvents`.
             winit::event::Event::NewEvents(_)
-            // `LoopDestroyed` is handled later in `process_and_emit_winit_event` so ignore it here.
-            | winit::event::Event::LoopDestroyed => {}
-        }
-
-        // We must reconfigure the wgpu surface if the window was resized.
-        if let winit::event::Event::WindowEvent {
-            ref mut event,
-            window_id,
-        } = event
-        {
-            match event {
-                winit::event::WindowEvent::Resized(new_inner_size) => {
-                    let mut windows = app.windows.borrow_mut();
-                    if let Some(window) = windows.get_mut(&window_id) {
-                        window.reconfigure_surface(new_inner_size.clone().into());
-                    }
-                }
-
-                winit::event::WindowEvent::ScaleFactorChanged {
-                    scale_factor,
-                    new_inner_size,
-                } => {
-                    let mut windows = app.windows.borrow_mut();
-                    if let Some(window) = windows.get_mut(&window_id) {
-                        window.tracked_state.scale_factor = *scale_factor;
-                        window.reconfigure_surface(new_inner_size.clone().into());
-                    }
-                }
-
-                _ => (),
-            }
+            // `LoopExiting` is handled later in `process_and_emit_winit_event` so ignore it here.
+            | winit::event::Event::LoopExiting
+            | winit::event::Event::AboutToWait
+            | winit::event::Event::MemoryWarning => {},
         }
 
         // Process the event with the user's functions and see if we need to exit.
@@ -1373,8 +1476,6 @@ fn run_loop<M, E>(
                     exit_fn(&app, model);
                 }
             }
-
-            *control_flow = ControlFlow::Exit;
             return;
         }
     });
@@ -1433,37 +1534,33 @@ fn apply_update<M, E>(
 // Whether or not the given event should toggle fullscreen.
 fn should_toggle_fullscreen(
     winit_event: &winit::event::WindowEvent,
-    mods: &winit::event::ModifiersState,
+    mods: &winit::keyboard::ModifiersState,
 ) -> bool {
-    let input = match *winit_event {
-        winit::event::WindowEvent::KeyboardInput { ref input, .. } => match input.state {
-            event::ElementState::Pressed => input,
+    let event = match *winit_event {
+        winit::event::WindowEvent::KeyboardInput { ref event, .. } => match event.state {
+            event::ElementState::Pressed => event,
             _ => return false,
         },
         _ => return false,
     };
 
-    let key = match input.virtual_keycode {
-        None => return false,
-        Some(k) => k,
+    let key_code = match event.physical_key {
+        winit::keyboard::PhysicalKey::Code(key_code) => key_code,
+        winit::keyboard::PhysicalKey::Unidentified(native_key_code) => return false,
     };
 
     // On linux, check for the F11 key (with no modifiers down).
     //
     // TODO: Somehow add special case for KDE?
     if cfg!(target_os = "linux") {
-        if *mods == winit::event::ModifiersState::empty() {
-            if let Key::F11 = key {
-                return true;
-            }
+        if *mods == winit::keyboard::ModifiersState::empty() && key_code == KeyCode::F11 {
+            return true;
         }
 
     // On macos and windows check for the logo key plus `f` with no other modifiers.
     } else if cfg!(target_os = "macos") || cfg!(target_os = "windows") {
-        if mods.logo() {
-            if let Key::F = key {
-                return true;
-            }
+        if *mods == winit::keyboard::ModifiersState::SUPER && key_code == KeyCode::KeyF {
+            return true;
         }
     }
 
@@ -1476,11 +1573,11 @@ fn should_toggle_fullscreen(
 // 2. Removes closed windows from app.
 // 3. Emits event via `event_fn`.
 // 4. Returns whether or not we should break from the loop.
-fn process_and_emit_winit_event<'a, M, E>(
+fn process_and_emit_winit_event<M, E>(
     app: &mut App,
     model: &mut M,
     event_fn: Option<EventFn<M, E>>,
-    winit_event: &winit::event::Event<'a, ()>,
+    winit_event: &winit::event::Event<()>,
 ) -> bool
 where
     M: 'static,
@@ -1496,9 +1593,17 @@ where
     {
         // If we should exit the app on escape, check for the escape key.
         if app.exit_on_escape() {
-            if let winit::event::WindowEvent::KeyboardInput { input, .. } = *event {
-                if let Some(Key::Escape) = input.virtual_keycode {
-                    exit_on_escape = true;
+            if let winit::event::WindowEvent::KeyboardInput {
+                event: key_event, ..
+            } = *event
+            {
+                match key_event.physical_key {
+                    winit::keyboard::PhysicalKey::Code(key_code) => {
+                        if key_code == KeyCode::Escape {
+                            exit_on_escape = true;
+                        }
+                    }
+                    winit::keyboard::PhysicalKey::Unidentified(native_key_code) => {}
                 }
             }
         }
@@ -1576,16 +1681,17 @@ where
                     app.mouse.window = Some(window_id);
                 }
 
-                winit::event::WindowEvent::KeyboardInput { input, .. } => {
-                    if let Some(key) = input.virtual_keycode {
-                        match input.state {
-                            event::ElementState::Pressed => {
-                                app.keys.down.keys.insert(key);
+                winit::event::WindowEvent::KeyboardInput { event, .. } => {
+                    match event.physical_key {
+                        winit::keyboard::PhysicalKey::Code(key_code) => match event.state {
+                            winit::event::ElementState::Pressed => {
+                                app.keys.down.keys.insert(key_code);
                             }
-                            event::ElementState::Released => {
-                                app.keys.down.keys.remove(&key);
+                            winit::event::ElementState::Released => {
+                                app.keys.down.keys.remove(&key_code);
                             }
-                        }
+                        },
+                        winit::keyboard::PhysicalKey::Unidentified(_) => (),
                     }
                 }
 
@@ -1700,9 +1806,6 @@ where
             match simple {
                 event::WindowEvent::KeyPressed(key) => call_user_function!(key_pressed, key),
                 event::WindowEvent::KeyReleased(key) => call_user_function!(key_released, key),
-                event::WindowEvent::ReceivedCharacter(char) => {
-                    call_user_function!(received_character, char)
-                }
                 event::WindowEvent::MouseMoved(pos) => call_user_function!(mouse_moved, pos),
                 event::WindowEvent::MousePressed(button) => {
                     call_user_function!(mouse_pressed, button)
@@ -1733,14 +1836,14 @@ where
         }
     }
 
-    // If the loop was destroyed, we'll need to exit.
-    let loop_destroyed = match winit_event {
-        winit::event::Event::LoopDestroyed => true,
+    // If the loop exiting we'll need to exit.
+    let loop_exiting = match winit_event {
+        winit::event::Event::LoopExiting => true,
         _ => false,
     };
 
     // If any exist conditions were triggered, indicate so.
-    let exit = if loop_destroyed || exit_on_escape || app.windows.borrow().is_empty() {
+    let exit = if loop_exiting || exit_on_escape || app.windows.borrow().is_empty() {
         true
     } else {
         false
@@ -1748,3 +1851,4 @@ where
 
     exit
 }
+

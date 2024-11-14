@@ -1,0 +1,17 @@
+{
+    "terminal.integrated.defaultProfile.windows": "Command Prompt",
+    "terminal.integrated.env.windows": {
+        "http_proxy": "http://127.0.0.1:10809",
+        "https_proxy": "http://127.0.0.1:10809",
+    },
+    "terminal.integrated.env.osx": {
+        "http_proxy": "http://127.0.0.1:10809",
+        "https_proxy": "http://127.0.0.1:10809",
+    },
+    "rust-analyzer.server.extraEnv": {
+        "RA_LOG": "error"
+    },
+    "rust-analyzer.inlayHints.typeHints": false,
+    "rust-analyzer.inlayHints.chainingHints": false,
+    "rust-analyzer.inlayHints.parameterHints": false
+}
